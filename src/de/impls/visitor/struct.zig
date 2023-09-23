@@ -22,9 +22,6 @@ pub fn Visitor(comptime Struct: type) type {
             const fields = comptime std.meta.fields(Value);
             const attributes = comptime getAttributes(Value, Deserializer);
 
-            var structure: Value = undefined;
-            var seen = [_]bool{false} ** fields.len;
-
             // Indicates whether or not unknown fields should be ignored.
             const ignore_unknown_fields = comptime blk: {
                 if (attributes) |attrs| {
@@ -39,105 +36,111 @@ pub fn Visitor(comptime Struct: type) type {
                 break :blk false;
             };
 
-            key_loop: while (try map.nextKey(ally, []const u8)) |key| {
-                // Indicates whether or not key matches any field in the struct.
-                var found = false;
-
-                inline for (fields, 0..) |field, i| {
-                    const attrs = comptime attrs: {
-                        if (attributes) |attrs| {
-                            if (@hasField(@TypeOf(attrs), field.name)) {
-                                const attr = @field(attrs, field.name);
-                                break :attrs @as(?@TypeOf(attr), attr);
-                            }
-                        }
-
-                        break :attrs null;
-                    };
-
-                    // The name that will be used to compare key against.
-                    //
-                    // Initially, name is set to field's name. But field has
-                    // the "rename" attribute set, name is set to the
-                    // attribute's value.
-                    comptime var name = name: {
-                        var name = field.name;
-
-                        if (attrs) |a| {
-                            const renamed = @hasField(@TypeOf(a), "rename");
-                            if (renamed) name = a.rename;
-                        }
-
-                        break :name name;
-                    };
-
-                    // If key matches field's name, rename attribute, or
-                    // any of its aliases, deserialize the field.
-                    const name_cmp = std.mem.eql(u8, name, key);
-                    const aliases_cmp = aliases_cmp: {
-                        comptime var aliases = aliases: {
-                            if (attrs) |a| {
-                                const aliased = @hasField(@TypeOf(a), "aliases");
-                                if (aliased) break :aliases a.aliases;
-                            }
-
-                            break :aliases_cmp false;
-                        };
-
-                        for (aliases) |a| {
-                            if (std.mem.eql(u8, a, key)) {
-                                break :aliases_cmp true;
-                            }
-                        }
-
-                        break :aliases_cmp false;
-                    };
-
-                    if (name_cmp or aliases_cmp) {
-                        if (field.is_comptime) {
-                            @compileError("TODO: DESERIALIZATION OF COMPTIME FIELD");
-                        }
-
-                        // If field has already been deserialized, return an
-                        // error.
-                        if (seen[i]) {
-                            return error.DuplicateField;
-                        }
-
-                        const value = try map.nextValue(ally, field.type);
-
-                        // Do assign value to field if the "skip" attribute is
-                        // set.
-                        //
-                        // Note that we still deserialize a value and check its
-                        // validity (e.g., its type is correct), we just don't
-                        // assign it to field.
-                        if (attrs) |a| {
-                            const skipped = @hasField(@TypeOf(a), "skip") and a.skip;
-                            if (skipped) continue :key_loop;
-                        }
-
-                        // Deserialize and assign value to field.
-                        @field(structure, field.name) = value;
-
-                        seen[i] = true;
-                        found = true;
-
-                        break;
-                    }
-                }
-
-                // Handle any keys that didn't match any fields in the struct.
-                //
-                // If the "ignore_unknown_fields" attribute is set, we'll
-                // deserialize and discard its corresponding value. Note that
-                // unlike with the "skip" attribute, the validity of an unknown
-                // field is not checked.
-                if (!found) {
+            // ComptimeStringMap does not support an empty key set, so we have
+            // to handle that case separately.
+            if (fields.len == 0) {
+                while (try map.nextKey(ally, []const u8)) |_| {
                     switch (ignore_unknown_fields) {
                         true => _ = try map.nextValue(ally, Ignored),
                         false => return error.UnknownField,
                     }
+                }
+                return .{};
+            }
+
+            const skip_bit = @as(usize, 1) << (@bitSizeOf(usize) - 1);
+
+            const KeyMap = comptime blk: {
+                const count = count: {
+                    var count: usize = 0;
+                    for (fields) |field| {
+                        count += 1;
+                        if (attributes) |attrs| {
+                            if (!@hasField(@TypeOf(attrs), field.name)) continue;
+                            const attr = @field(attrs, field.name);
+                            if (@hasField(@TypeOf(attr), "aliases")) count += attr.aliases.len;
+                        }
+                    }
+                    break :count count;
+                };
+
+                var kvs: [count]struct { []const u8, usize } = undefined;
+                var kv_i: usize = 0;
+                for (fields, 0..) |field, field_i| {
+                    const attrs = attrs: {
+                        if (attributes) |attrs| {
+                            if (@hasField(@TypeOf(attrs), field.name)) {
+                                const attr = @field(attrs, field.name);
+                                break :attrs attr;
+                            }
+                        }
+
+                        kvs[kv_i] = .{ field.name, field_i };
+                        kv_i += 1;
+                        continue;
+                    };
+
+                    const value = if (@hasField(@TypeOf(attrs), "skip") and attrs.skip)
+                        field_i | skip_bit
+                    else
+                        field_i;
+
+                    const name = if (@hasField(@TypeOf(attrs), "rename")) attrs.rename else field.name;
+                    kvs[kv_i] = .{ name, value };
+                    kv_i += 1;
+
+                    if (@hasField(@TypeOf(attrs), "aliases")) {
+                        for (attrs.aliases) |alias| {
+                            kvs[kv_i] = .{ alias, value };
+                            kv_i += 1;
+                        }
+                    }
+                }
+
+                break :blk std.ComptimeStringMap(usize, kvs);
+            };
+
+            var structure: Value = undefined;
+            var seen = [_]bool{false} ** fields.len;
+
+            while (try map.nextKey(ally, []const u8)) |key| {
+                const key_i = KeyMap.get(key) orelse {
+                    // Handle any keys that didn't match any fields in the struct.
+                    //
+                    // If the "ignore_unknown_fields" attribute is set, we'll
+                    // deserialize and discard its corresponding value. Note that
+                    // unlike with the "skip" attribute, the validity of an unknown
+                    // field is not checked.
+                    switch (ignore_unknown_fields) {
+                        true => _ = try map.nextValue(ally, Ignored),
+                        false => return error.UnknownField,
+                    }
+                    continue;
+                };
+                const i = key_i & ~skip_bit;
+                if (seen[i]) return error.DuplicateField;
+
+                switch (i) {
+                    inline 0...fields.len - 1 => |idx| {
+                        const field = fields[idx];
+                        if (field.is_comptime) {
+                            @compileError("TODO: DESERIALIZATION OF COMPTIME FIELD");
+                        }
+
+                        const value = try map.nextValue(ally, field.type);
+
+                        // Don't assign value to field if the "skip" attribute
+                        // is set.
+                        //
+                        // Note that we still deserialize a value and check its
+                        // validity (e.g., its type is correct), we just don't
+                        // assign it to field.
+                        if (key_i & skip_bit != 0) continue;
+
+                        @field(structure, field.name) = value;
+                        seen[i] = true;
+                    },
+                    else => unreachable,
                 }
             }
 
